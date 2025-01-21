@@ -1,0 +1,55 @@
+[env]
+CARGO_MAKE_EXTEND_WORKSPACE_MAKEFILE = true
+
+[tasks.pre-step]
+workspace = false
+script = [
+    '''
+    rm -rf plugins/debug/* plugins/release/*
+    '''
+]
+
+[tasks.pre-settings]
+workspace = false
+script = [
+  "echo \"Create directory plugins/debug and plugins/release\"",
+  "mkdir -p plugins/debug plugins/release"
+]
+
+
+[tasks.build-workspace]
+workspace = false
+command = "cargo"
+args = ["build", "--workspace"]
+
+[tasks.post-step-debug]
+workspace = false
+description = "Copy dylibs for debug build"
+script = [
+    '''
+    [ -d "target/debug" ] && find target/debug -maxdepth 1 \( -name "*.so" -o -name "*.dylib" -o -name "*.dll" \) -exec cp '{}' plugins/debug \; || echo "Warning: Directory 'target/debug' does not exist."
+    echo "Copied debug dylibs to plugins/debug"
+    '''
+]
+
+[tasks.post-step-release]
+workspace = false
+description = "Copy dylibs for release build"
+script = [
+    '''
+    [ -d "target/release" ] && find target/release -maxdepth 1 \( -name "*.so" -o -name "*.dylib" -o -name "*.dll" \) -exec cp '{}' plugins/release \; || echo "Warning: Directory 'target/release' does not exist."
+    echo "Copied release dylibs to plugins/release"
+    '''
+]
+
+[tasks.post-step]
+workspace = false
+description = "Copy dylibs for all builds"
+dependencies = ["post-step-debug", "post-step-release"]
+
+
+[tasks.build-all]
+workspace = false
+dependencies = ["pre-step", "pre-settings", "build-workspace", "post-step"]
+
+

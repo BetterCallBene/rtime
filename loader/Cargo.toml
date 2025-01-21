@@ -1,0 +1,14 @@
+[package]
+name = "loader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+interfaces = {path = "../interfaces"}
+tokio = {"version" = "1.42.0", "features" = ["full"]}
+env_logger = "0.11.6"
+log = "0.4.22"
+
+[dev-dependencies]
+test-log = "0.2.16"
+rstest = "0.24.0"
