@@ -1,0 +1,27 @@
+[package]
+name = "webinterface"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+interfaces = {path = "../interfaces"}
+actix-web = {"version"="4.9.0"}
+tokio = {"version" = "1.42.0", "features" = ["full"]}
+once_cell = {"version" = "1.20.2"}
+futures = {"version" = "0.3.31"}
+lazy_static = {"version" = "1.5.0" }
+env_logger = "0.11.6"
+log = "*"
+libc = "0.2.169"
+serde = { version = "1.0.215", features = ["derive"] }
+serde_yml = "0.0.12"
+serial_test = "3.2.0"
+
+[dev-dependencies]
+test-log = "*"
+reqwest = { version = "0.12.12" }
+rstest = "0.24.0"
+
