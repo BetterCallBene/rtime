@@ -14,5 +14,6 @@ clap = { version = "4.5.23", features = ["derive"] }
 libloading = "0.8.6"
 
 [dev-dependencies]
+serial_test = "3.2.0"
 test-log = "0.2.16"
 rstest = "0.24.0"

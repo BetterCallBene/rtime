@@ -1,4 +1,4 @@
-use std::{os::raw::c_void, marker};
+use std::{os::raw::c_void, marker, iter};
 use crate::bindings::{self, CAPABILITY_FUNCTION_NAME_LEN};
 
 // reimplementation of libloading::Function to allow custom getter
@@ -132,6 +132,33 @@ impl Capabilities {
 
     pub fn len(&self) -> usize {
         self.0.n_capabilities as usize
+    }
+
+    pub fn iter(&self) -> CapabilitiesIterator {
+        CapabilitiesIterator {
+            capabilities: self,
+            index: 0,
+        }
+    }
+
+}
+
+pub struct CapabilitiesIterator<'a> {
+    capabilities: &'a Capabilities,
+    index: usize,
+}
+
+impl<'a> iter::Iterator for CapabilitiesIterator<'a> {
+    type Item = Capability;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index < self.capabilities.len() {
+            let cap = &self.capabilities.0.capability[self.index];
+            self.index += 1;
+            Some(Capability::from_raw(cap))
+        } else {
+            None
+        }
     }
 }
 
