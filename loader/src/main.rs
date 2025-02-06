@@ -2,13 +2,15 @@ mod helper;
 mod rtlibrary;
 use clap::Parser;
 use helper::{create_library_name, load_library, plugin_dir};
-use interfaces::blackboard::BlackboardEntry;
-use log::{debug, info, trace, warn};
+use interfaces::blackboard::{self, BlackboardEntries};
+use log::{debug, info, trace, warn, error};
 use rtlibrary::{RTLibrary, RTLibraryType};
 use serde::{Deserialize, Serialize};
 use libloading::Symbol;
 use serde_yml::mapping::Iter;
-use std::{any::Any, collections::HashMap, os::raw::{c_char, c_int, c_void}, path::PathBuf};
+use std::{any::Any, collections::HashMap, os::raw::{c_char, c_int, c_void}, path::PathBuf, sync::Arc};
+use tokio::time::{self, Duration as dur};
+use tokio::signal;
 
 #[derive(Parser, Debug)]
 #[command(version = "0.1.0", about = "Kiss Runtime")]
@@ -20,11 +22,11 @@ struct Args {
 struct LibraryConfig {
     name: String,
     path: Option<PathBuf>,
-    attributes: Option<Vec<BlackboardEntry>>,
+    attributes: Option<BlackboardEntries>,
 }
 
 impl LibraryConfig {
-    fn new(name: &str, path: Option<PathBuf>, attributes: Option<Vec<BlackboardEntry>>) -> Self {
+    fn new(name: &str, path: Option<PathBuf>, attributes: Option<BlackboardEntries>) -> Self {
         Self {
             name: name.to_string(),
             path,
@@ -42,11 +44,12 @@ struct RTConfig {
 
 trait Component: {
 
-    fn run(&self, function: &str, caps: &interfaces::capabilities::Capabilities, attr: &str) -> Result<*mut i32, String>
+    fn run(&self, function: &str, caps: &interfaces::capabilities::Capabilities) -> Result<i32, String>
     {
         let library = &self.library().library;
+        let attr = self.attributes();
         let result = unsafe {
-            library.get(function.as_bytes()).map(|f: Symbol<unsafe extern "C" fn(&interfaces::bindings::Capabilities, *const c_char) -> *mut c_int>| {
+            library.get(function.as_bytes()).map(|f: Symbol<unsafe extern "C" fn(&interfaces::bindings::Capabilities, *const c_char) -> c_int>| {
                 f(caps.inner(), attr.as_ptr() as *const c_char)
             })
         };
@@ -55,7 +58,7 @@ trait Component: {
             Err(e) => Err(format!("Function '{}' can not be called. Reason: {}", function, e))
         }
     }
-
+    fn attributes(&self)-> &str;
     fn library(&self) -> &RTLibrary;
     fn requires(&self) -> &Vec<String>;
 }
@@ -85,6 +88,14 @@ impl Component for Skill  {
     fn requires(&self) -> &Vec<String> {
         &self.requires
     }
+
+    fn attributes(&self)-> &str {
+        if self.library.config_attr_str.is_none() {
+            ""
+        } else {
+            self.library.config_attr_str.as_ref().unwrap().as_str()
+        }
+    }
 }
 
 impl Component for Service  {
@@ -94,6 +105,14 @@ impl Component for Service  {
 
     fn requires(&self) -> &Vec<String> {
         &self.requires
+    }
+
+    fn attributes(&self)-> &str {
+        if self.library.config_attr_str.is_none() {
+            ""
+        } else {
+            self.library.config_attr_str.as_ref().unwrap().as_str()
+        }
     }
 }
 
@@ -115,8 +134,8 @@ impl Skill {
         })
     }
 
-    fn run(&self, caps: &interfaces::capabilities::Capabilities, attr: &str) -> Result<*mut i32, String> {
-        Component::run(self, "run", caps, attr)
+    fn run(&self, caps: &interfaces::capabilities::Capabilities) -> Result<i32, String> {
+        Component::run(self, "run", caps)
     }
 }
 
@@ -133,14 +152,14 @@ impl Service {
         })
     }
 
-    fn start(&self, caps: &interfaces::capabilities::Capabilities, attr: &str) {
-        Component::run(self, "start", caps, attr);
+    fn start(&self, caps: &interfaces::capabilities::Capabilities) -> Result<i32, String> {
+        Component::run(self, "start", caps)
     }
 
     fn stop(&self) {
         unsafe {
             let library = &self.library.library;
-            let result = library.get("stop".as_bytes()).map(|f: Symbol<unsafe extern "C" fn() -> *mut c_int>| {
+            let result = library.get("stop".as_bytes()).map(|f: Symbol<unsafe extern "C" fn() -> c_int>| {
                 f()
             });
             match result {
@@ -159,10 +178,15 @@ struct Components {
     inner: ComponentsVec,
 }
 
+fn get_capability_fn<'a>(library: &'a RTLibrary, capability_entry: &str) -> Result<Symbol<'a, unsafe extern "C" fn() -> *mut c_void>, String> {
+    unsafe {library.library.get(capability_entry.as_bytes())
+        .map(|f: Symbol<unsafe extern "C" fn() -> *mut c_void>| f)
+        .map_err(|e| format!("Capability cannot be loaded. Reason: {}", e))}
+}
 
 fn create_caps(
     requires: &Vec<String>,
-    libraries: &Vec<ComponentsType>,
+    libraries: &ComponentsVec,
 ) -> interfaces::capabilities::Capabilities {
     let mut caps = interfaces::capabilities::Capabilities::new();
 
@@ -187,18 +211,38 @@ fn create_caps(
         let provides = provides.as_ref().unwrap();
 
         for capability in provides {
-            let capability_name = capability.capability;
-            let capability_entry = capability.entry.as_bytes();
+            let capability_name = capability.capability.clone();
+            let capability_entry = capability.entry.clone();
 
-            unsafe {
-                let capability_fn: Symbol<unsafe extern "C" fn() -> *mut c_void> =
-                    lib.library.get(capability_entry).unwrap();
-                let capability_fn = capability_fn.try_as_raw_ptr().unwrap();
-                caps.add(interfaces::capabilities::Capability::new(
-                    &capability_name,
-                    capability_fn,
-                ))
+            trace!("Capability: {}", capability_name);
+            trace!("Entry: {}", capability_entry);
+
+            let capability_fn = unsafe {
+
+                 match lib{
+                    Some(ComponentsType::Service(service)) => {
+                        get_capability_fn(&service.library, capability_entry.as_str())
+                    }
+                    Some(ComponentsType::Skill(skill)) => {
+                        get_capability_fn(&skill.library, capability_entry.as_str())
+                    }
+                    None => {
+                        let error_string = format!("Capability '{}' not found in '{}'", capability_name, require_lib);
+                        error!("{}", error_string);
+                        Err(error_string)
+                    }
+                }
             };
+
+            if capability_fn.is_err() {
+                panic!("System configuration error. Reason: {}", capability_fn.unwrap_err());
+            }
+
+            let capability_fn = capability_fn.unwrap();   
+            caps.add(interfaces::capabilities::Capability::new(
+                &capability_name,
+                unsafe{capability_fn.try_as_raw_ptr().unwrap()}
+            ));
         }
     }
     caps
@@ -231,7 +275,11 @@ impl Components {
         for component in self.inner.iter().rev(){
             
             if let ComponentsType::Service(service) = component {
-                // service.start(&create_caps(&service.requires, &self.libraries));
+                
+                service.start(&create_caps(&service.requires, &self.inner)).map_err(|e| {
+                    warn!("Service '{}' can not be started. Reason: {}", service.library.summary.name, e);
+                }).unwrap();
+                
             }
             
         }
@@ -239,7 +287,7 @@ impl Components {
 }
 
 
-fn load_libraries(config: LibraryConfigs) -> Vec<RTLibrary>{
+fn load_libraries(config: &LibraryConfigs) -> Vec<RTLibrary>{
     info!("Load libraries...");
     let mut libraries: Vec<RTLibrary> = Vec::new();
 
@@ -269,7 +317,7 @@ fn load_libraries(config: LibraryConfigs) -> Vec<RTLibrary>{
         match library {
             Ok(lib) => {
                 info!("Successfull load library: {}", libconfig.name);
-                match RTLibrary::new(lib) {
+                match RTLibrary::new(lib, libconfig.attributes.clone()) {
                     Ok(rtlibrary) => {
                         let library_name = rtlibrary.summary.name.clone();
 
@@ -297,69 +345,6 @@ fn load_libraries(config: LibraryConfigs) -> Vec<RTLibrary>{
 
 
 
-
-
-
-
-
-//     for libconfig in config {
-//         let path = libconfig
-//             .path
-//             .clone()
-//             .or(Some(
-//                 plugin_dir().join(create_library_name(&libconfig.name)),
-//             ))
-//             .unwrap();
-//         info!(
-//             "Try to loading library: {} ({})",
-//             libconfig.name,
-//             path.to_str().unwrap()
-//         );
-
-//         let library = load_library(&path).map_err(|e| {
-//             format!(
-//                 "Failed loading library '{}' ({}): Reason: {}",
-//                 libconfig.name,
-//                 path.to_str().unwrap(),
-//                 e
-//             )
-//         });
-
-//         match library {
-//             Ok(lib) => {
-//                 info!("Successfull load library: {}", libconfig.name);
-//                 match Skill::new(lib) {
-//                     Ok(skill) => {
-//                         let library_name = skill.summary.name.clone();
-//                         let library_type = skill.summary.library_type.clone();
-
-//                         if libraries.contains_key(library_name.as_str()) {
-//                             warn!("Library '{}' already loaded. Skip loading.", library_name);
-//                             continue;
-//                         }
-
-//                         libraries.insert(library_name.clone(), skill);
-
-//                         if library_type == LibraryType::Service {
-//                             trace!("Library '{}' is a service", library_name);
-//                             services.push(library_name);
-//                         } else {
-//                             trace!("Library '{}' is not a service", library_name);
-//                         }
-//                     }
-//                     Err(e) => {
-//                         warn!("Capability can not be load. Reason: {}", e)
-//                     }
-//                 }
-//             }
-//             Err(e) => {
-//                 warn!("{}", e);
-//             }
-//         }
-//     }
-//     (libraries, services)
-// }
-
 #[tokio::main]
 async fn main() -> Result<(), String> {
     env_logger::init();
@@ -383,7 +368,44 @@ async fn main() -> Result<(), String> {
     let config: RTConfig = serde_yml::from_str(&config_str)
         .map_err(|e| format!("Failed to parse config: {}. Reason: {}", config_str, e))?;
 
-    //let components = Components::new(config);
+
+    let libraries = load_libraries(&config.libraries);
+    let components = Components::new(libraries);
+
+    components.start_services();
+
+    let components = Arc::new(components);
+    
+    let task_handle = tokio::spawn(async move {
+        let mut interval = time::interval(dur::from_millis(100));
+
+        let requires = vec!["blackboard".to_string()];
+        let caps = create_caps(&requires, &components.inner);
+
+        let string_get_cap = caps.get("blackboard_get_string");
+        
+        if string_get_cap.is_none() {
+            //panic!("Capability 'blackboard_set_string' not found");
+            error!("Blackboard is not available");
+            return;
+        }
+
+        
+        loop {
+
+            interval.tick().await;
+        }
+    });
+
+    // Wait for Ctrl+C signal
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            info!("Ctrl+C received! Shutting down...");
+        }
+        _ = task_handle => {
+            info!("Main task finished");
+        }
+    }
 
     Ok(())
 }
@@ -391,6 +413,7 @@ async fn main() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use interfaces::capabilities::Function;
     use serial_test::serial;
     
     #[serial]
@@ -398,7 +421,7 @@ mod tests {
     fn test_load_libraries() {
         let config = vec![LibraryConfig::new("blackboard", None, None)];
 
-        let libraries = load_libraries(config);
+        let libraries = load_libraries(&config);
         assert_eq!(libraries.len(), 1);
 
         let found = libraries.iter().find(|lib| lib.name() == "blackboard");
@@ -410,7 +433,7 @@ mod tests {
     fn test_load_library_twice() {
         let config = vec![LibraryConfig::new("blackboard", None, None), LibraryConfig::new("blackboard", None, None)];
 
-        let libraries = load_libraries(config);
+        let libraries = load_libraries(&config);
         assert_eq!(libraries.len(), 1);
 
         let found = libraries.iter().find(|lib| lib.name() == "blackboard");
@@ -422,34 +445,50 @@ mod tests {
     fn test_create_component() {
         let config = vec![LibraryConfig::new("blackboard", None, None)];
 
-        let libraries = load_libraries(config);
+        let libraries = load_libraries(&config);
         assert_eq!(libraries.len(), 1);
 
         let found = libraries.iter().find(|lib| lib.name() == "blackboard");
         assert!(found.is_some());
 
         let components = Components::new(libraries);
+        assert_eq!(components.inner.len(), 1);
     }
     
     // #[serial]
     // #[test_log::test]
     // fn test_
 
-    // #[serial]
-    // #[test_log::test]
-    // fn test_create_caps() {
-    //     let config = vec![LibraryConfig::new("blackboard", None, None), LibraryConfig::new("webinterface", None, None)];
-    //     let libraries = load_libraries(config);
-    //     assert_eq!(libraries.len(), 2);
-
-    //     let requires = vec!["blackboard".to_string()];
-    //     let caps = create_caps(&requires, &libraries);
-
-    //     assert_eq!(caps.len(), 16);
+    #[serial]
+    #[test_log::test]
+    fn test_create_caps() {
         
-    //     for cap in caps.iter() {
-    //         let name = cap.name();
-    //         assert_eq!(name[.."blackboard".len()], "blackboard".to_string());
-    //     }
-    // }
+        let config = vec![LibraryConfig::new("blackboard", None, None), LibraryConfig::new("webinterface", None, None)];
+
+        let libraries = load_libraries(&config);
+        assert_eq!(libraries.len(), 2);
+
+        let found = libraries.iter().find(|lib| lib.name() == "blackboard");
+        assert!(found.is_some());
+
+        let components = Components::new(libraries);
+        assert_eq!(components.inner.len(), 2);
+
+        let requires = vec!["blackboard".to_string()];
+        let caps = create_caps(&requires, &components.inner);
+
+        assert_eq!(caps.len(), 16);
+
+        let string_set_cap = caps.get("blackboard_set_string");
+        assert!(string_set_cap.is_some());
+        // let string_set_cap = string_set_cap.unwrap();
+
+        
+        // let result = unsafe {
+        //     let f: Function<unsafe extern "C" fn(*const c_char, *const c_char) -> c_int> = string_set_cap.get().unwrap();
+        //     f("example_key\0".as_ptr() as *const c_char, "test\0".as_ptr() as *const c_char)
+        // };
+
+        // assert_eq!(result, 0);
+    }
 }
