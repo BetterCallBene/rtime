@@ -1,4 +1,6 @@
-[
+{
+"libraries": [
   {"name": "blackboard", "attributes": [{"key": "example", "value": "Hello from Blackboard!"}]},
   {"name": "webinterface", "attributes": [{"key": "port", "value": 8080}]}
 ]
+}
