@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+
+use interfaces::blackboard::BlackboardEntries;
 use libloading::{Library, Symbol};
 use std::ffi::CStr;
 
@@ -80,10 +82,11 @@ impl Clone for RTLibrarySummary {
 pub struct RTLibrary {
     pub library: Library,
     pub summary: RTLibrarySummary,
+    pub config_attr_str: Option<String>,
 }
 
 impl RTLibrary {
-    pub fn new(library: Library) -> Result<Self, String> {
+    pub fn new(library: Library, config: Option<BlackboardEntries>) -> Result<Self, String> {
         unsafe {
             let symbol: Symbol<unsafe extern "C" fn() -> *const ::std::os::raw::c_char> = library
                 .get(b"summary")
@@ -104,9 +107,15 @@ impl RTLibrary {
                 )
             })?;
 
+            let config_attr_str = match config {
+                Some(config) => Some(serde_yml::to_string(&config).unwrap()), // Error handling should not be needed
+                None => None,
+            };
+
             Ok(Self {
-                library,
                 summary: summary,
+                config_attr_str: config_attr_str,
+                library: library,
             })
         }
     }
@@ -170,7 +179,7 @@ mod tests {
     fn test_load_rtlibrary(blackboard_plugin_path: PathBuf) {
         let library = load_library(&blackboard_plugin_path);
         assert!(library.is_ok());
-        let rtlibrary = RTLibrary::new(library.unwrap());
+        let rtlibrary = RTLibrary::new(library.unwrap(), None);
         match &rtlibrary {
             Ok(_) => assert!(true),
             Err(e) => {
