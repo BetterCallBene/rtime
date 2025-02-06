@@ -4,8 +4,6 @@ use interfaces::blackboard::BlackboardEntries;
 use libloading::{Library, Symbol};
 use std::ffi::CStr;
 
-use super::helper::{create_library_name, plugin_dir, load_library};
-
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub enum RTLibraryType {
     Service,
@@ -123,18 +121,6 @@ impl RTLibrary {
     pub fn name(&self) -> &str {
         &self.summary.name
     }
-
-    pub fn library_type(&self) -> &RTLibraryType {
-        &self.summary.library_type
-    }
-
-    pub fn version(&self) -> &str {
-        &self.summary.version
-    }
-
-    pub fn is_service(&self) -> bool {
-        self.summary.library_type == RTLibraryType::Service
-    }
 }
 
 #[cfg(test)]
@@ -143,6 +129,7 @@ mod tests {
     use rstest::fixture;
     use rstest::rstest;
     use serial_test::serial;
+    use super::super::helper::{create_library_name, plugin_dir, load_library};
     
     use std::path::PathBuf;
     use log::error;

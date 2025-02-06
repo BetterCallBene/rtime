@@ -1,5 +1,5 @@
-use libloading::{Library, Symbol};
-use std::{env, env::consts::OS, path::PathBuf, };
+use libloading::Library;
+use std::{env, env::consts::OS, path::PathBuf};
 
 pub fn plugin_dir() -> PathBuf {
     let profile = if cfg!(debug_assertions) {

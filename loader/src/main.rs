@@ -1,14 +1,14 @@
 mod helper;
 mod rtlibrary;
+mod config;
+mod components;
 use clap::Parser;
 use helper::{create_library_name, load_library, plugin_dir};
-use interfaces::blackboard::{self, BlackboardEntries};
-use log::{debug, info, trace, warn, error};
-use rtlibrary::{RTLibrary, RTLibraryType};
-use serde::{Deserialize, Serialize};
-use libloading::Symbol;
-use serde_yml::mapping::Iter;
-use std::{any::Any, collections::HashMap, os::raw::{c_char, c_int, c_void}, path::PathBuf, sync::Arc};
+use config::{LibraryConfigs, RTConfig};
+use rtlibrary::RTLibrary;
+use components::{Components, create_caps};
+use log::{info, warn, error};
+use std::{path::PathBuf, sync::Arc};
 use tokio::time::{self, Duration as dur};
 use tokio::signal;
 
@@ -17,275 +17,6 @@ use tokio::signal;
 struct Args {
     config: PathBuf,
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LibraryConfig {
-    name: String,
-    path: Option<PathBuf>,
-    attributes: Option<BlackboardEntries>,
-}
-
-impl LibraryConfig {
-    fn new(name: &str, path: Option<PathBuf>, attributes: Option<BlackboardEntries>) -> Self {
-        Self {
-            name: name.to_string(),
-            path,
-            attributes,
-        }
-    }
-}
-
-type LibraryConfigs = Vec<LibraryConfig>;
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RTConfig {
-    libraries: LibraryConfigs,
-}
-
-trait Component: {
-
-    fn run(&self, function: &str, caps: &interfaces::capabilities::Capabilities) -> Result<i32, String>
-    {
-        let library = &self.library().library;
-        let attr = self.attributes();
-        let result = unsafe {
-            library.get(function.as_bytes()).map(|f: Symbol<unsafe extern "C" fn(&interfaces::bindings::Capabilities, *const c_char) -> c_int>| {
-                f(caps.inner(), attr.as_ptr() as *const c_char)
-            })
-        };
-        match result {
-            Ok(r) => Ok(r),
-            Err(e) => Err(format!("Function '{}' can not be called. Reason: {}", function, e))
-        }
-    }
-    fn attributes(&self)-> &str;
-    fn library(&self) -> &RTLibrary;
-    fn requires(&self) -> &Vec<String>;
-}
-
-enum ComponentsType{
-    Service(Service),
-    Skill(Skill)
-}
-
-type ComponentsVec = Vec<ComponentsType>;
-
-struct Skill{
-    library: RTLibrary,
-    requires: Vec<String>
-}
-
-struct Service{
-    library: RTLibrary,
-    requires: Vec<String>
-}
-
-impl Component for Skill  {
-    fn library(&self) -> &RTLibrary {
-        &self.library
-    }
-
-    fn requires(&self) -> &Vec<String> {
-        &self.requires
-    }
-
-    fn attributes(&self)-> &str {
-        if self.library.config_attr_str.is_none() {
-            ""
-        } else {
-            self.library.config_attr_str.as_ref().unwrap().as_str()
-        }
-    }
-}
-
-impl Component for Service  {
-    fn library(&self) -> &RTLibrary {
-        &self.library
-    }
-
-    fn requires(&self) -> &Vec<String> {
-        &self.requires
-    }
-
-    fn attributes(&self)-> &str {
-        if self.library.config_attr_str.is_none() {
-            ""
-        } else {
-            self.library.config_attr_str.as_ref().unwrap().as_str()
-        }
-    }
-}
-
-impl Drop for Service {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-impl Skill {
-    fn new(library: RTLibrary) -> Result<Self, String> {
-        Ok(Self {
-            requires: if library.summary.requires.is_some() {
-                library.summary.requires.clone().unwrap()
-            } else {
-                Vec::new()
-            },
-            library: library
-        })
-    }
-
-    fn run(&self, caps: &interfaces::capabilities::Capabilities) -> Result<i32, String> {
-        Component::run(self, "run", caps)
-    }
-}
-
-
-impl Service {
-    fn new(library: RTLibrary) -> Result<Self, String> {
-        Ok(Self {
-            requires: if library.summary.requires.is_some() {
-                library.summary.requires.clone().unwrap()
-            } else {
-                Vec::new()
-            },
-            library: library
-        })
-    }
-
-    fn start(&self, caps: &interfaces::capabilities::Capabilities) -> Result<i32, String> {
-        Component::run(self, "start", caps)
-    }
-
-    fn stop(&self) {
-        unsafe {
-            let library = &self.library.library;
-            let result = library.get("stop".as_bytes()).map(|f: Symbol<unsafe extern "C" fn() -> c_int>| {
-                f()
-            });
-            match result {
-                Ok(_) => {
-                    info!("Service '{}' stopped", self.library.summary.name);
-                }
-                Err(e) => {
-                    warn!("Service '{}' can not be stopped. Reason: {}", self.library.summary.name, e);
-                }
-            }
-        }
-    }
-}
-
-struct Components {
-    inner: ComponentsVec,
-}
-
-fn get_capability_fn<'a>(library: &'a RTLibrary, capability_entry: &str) -> Result<Symbol<'a, unsafe extern "C" fn() -> *mut c_void>, String> {
-    unsafe {library.library.get(capability_entry.as_bytes())
-        .map(|f: Symbol<unsafe extern "C" fn() -> *mut c_void>| f)
-        .map_err(|e| format!("Capability cannot be loaded. Reason: {}", e))}
-}
-
-fn create_caps(
-    requires: &Vec<String>,
-    libraries: &ComponentsVec,
-) -> interfaces::capabilities::Capabilities {
-    let mut caps = interfaces::capabilities::Capabilities::new();
-
-    for require_lib in requires {
-        let lib = libraries.iter().find(|lib| {
-            match lib {
-                ComponentsType::Service(service) => service.library.summary.name == *require_lib,
-                ComponentsType::Skill(skill) => skill.library.summary.name == *require_lib
-            }
-        });
-        
-        let provides = match lib {
-            Some(ComponentsType::Service(service)) => &service.library.summary.provides,
-            Some(ComponentsType::Skill(skill)) => &skill.library.summary.provides,
-            None => {
-                warn!("Library '{}' not found", require_lib);
-                continue;
-            }
-        };
-        
-
-        let provides = provides.as_ref().unwrap();
-
-        for capability in provides {
-            let capability_name = capability.capability.clone();
-            let capability_entry = capability.entry.clone();
-
-            trace!("Capability: {}", capability_name);
-            trace!("Entry: {}", capability_entry);
-
-            let capability_fn = unsafe {
-
-                 match lib{
-                    Some(ComponentsType::Service(service)) => {
-                        get_capability_fn(&service.library, capability_entry.as_str())
-                    }
-                    Some(ComponentsType::Skill(skill)) => {
-                        get_capability_fn(&skill.library, capability_entry.as_str())
-                    }
-                    None => {
-                        let error_string = format!("Capability '{}' not found in '{}'", capability_name, require_lib);
-                        error!("{}", error_string);
-                        Err(error_string)
-                    }
-                }
-            };
-
-            if capability_fn.is_err() {
-                panic!("System configuration error. Reason: {}", capability_fn.unwrap_err());
-            }
-
-            let capability_fn = capability_fn.unwrap();   
-            caps.add(interfaces::capabilities::Capability::new(
-                &capability_name,
-                unsafe{capability_fn.try_as_raw_ptr().unwrap()}
-            ));
-        }
-    }
-    caps
-}
-
-impl Components {
-    fn new(mut libraries: Vec<RTLibrary>) -> Self {
-        let mut inner:ComponentsVec = Vec::new();
-        while let Some(lib) = libraries.pop() {
-            let library_type = lib.summary.library_type.clone();
-    
-            let component:ComponentsType = match library_type {
-                RTLibraryType::Service => {
-                    ComponentsType::Service(Service::new(lib).unwrap())
-                }
-                RTLibraryType::Skill => {
-                    ComponentsType::Skill(Skill::new(lib).unwrap())
-                }
-            };
-    
-            inner.push(component);
-        }
-        Self {
-            inner
-        }
-    }
-
-    fn start_services(&self)
-    {
-        for component in self.inner.iter().rev(){
-            
-            if let ComponentsType::Service(service) = component {
-                
-                service.start(&create_caps(&service.requires, &self.inner)).map_err(|e| {
-                    warn!("Service '{}' can not be started. Reason: {}", service.library.summary.name, e);
-                }).unwrap();
-                
-            }
-            
-        }
-    }
-}
-
 
 fn load_libraries(config: &LibraryConfigs) -> Vec<RTLibrary>{
     info!("Load libraries...");
@@ -343,6 +74,25 @@ fn load_libraries(config: &LibraryConfigs) -> Vec<RTLibrary>{
     libraries
 }
 
+async fn task_manager(compoents: Arc<Components>) {
+    let mut interval = time::interval(dur::from_millis(100));
+
+    let requires = vec!["blackboard".to_string()];
+    let caps = create_caps(&requires, &compoents.inner);
+
+    let string_get_cap = caps.get("blackboard_get_string");
+    
+    if string_get_cap.is_none() {
+        //panic!("Capability 'blackboard_set_string' not found");
+        error!("Blackboard is not available");
+        return;
+    }
+    
+    loop {
+
+        interval.tick().await;
+    }
+}
 
 
 #[tokio::main]
@@ -371,31 +121,10 @@ async fn main() -> Result<(), String> {
 
     let libraries = load_libraries(&config.libraries);
     let components = Components::new(libraries);
-
     components.start_services();
 
     let components = Arc::new(components);
-    
-    let task_handle = tokio::spawn(async move {
-        let mut interval = time::interval(dur::from_millis(100));
-
-        let requires = vec!["blackboard".to_string()];
-        let caps = create_caps(&requires, &components.inner);
-
-        let string_get_cap = caps.get("blackboard_get_string");
-        
-        if string_get_cap.is_none() {
-            //panic!("Capability 'blackboard_set_string' not found");
-            error!("Blackboard is not available");
-            return;
-        }
-
-        
-        loop {
-
-            interval.tick().await;
-        }
-    });
+    let task_handle = tokio::spawn(task_manager(components.clone()));
 
     // Wait for Ctrl+C signal
     tokio::select! {
@@ -413,8 +142,19 @@ async fn main() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use interfaces::capabilities::Function;
     use serial_test::serial;
+    use super::config::LibraryConfig;
+    use interfaces::blackboard::BlackboardEntries;
+
+    impl LibraryConfig {
+        fn new(name: &str, path: Option<PathBuf>, attributes: Option<BlackboardEntries>) -> Self {
+            LibraryConfig {
+                name: name.to_string(),
+                path: path,
+                attributes: attributes,
+            }
+        }
+    }
     
     #[serial]
     #[test_log::test]
