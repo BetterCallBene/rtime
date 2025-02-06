@@ -1307,6 +1307,7 @@ dependencies = [
  "rstest",
  "serde",
  "serde_yml",
+ "serial_test",
  "test-log",
  "tokio",
 ]

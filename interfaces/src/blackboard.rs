@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum BlackboardValue {
     String(String),
@@ -29,8 +29,10 @@ impl BlackboardValue {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BlackboardEntry {
     pub key: String,
     pub value: BlackboardValue,
 }
+
+pub type BlackboardEntries = Vec<BlackboardEntry>;
