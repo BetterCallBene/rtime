@@ -29,6 +29,9 @@ impl <T> Clone for Function<T> {
     }
 }
 
+unsafe impl Send for bindings::Capability {}
+unsafe impl Sync for bindings::Capability {}
+
 pub struct Capability (bindings::Capability);
 
 
@@ -44,6 +47,7 @@ fn capability_name(cap: &bindings::Capability) -> String {
 }
 
 unsafe impl Send for Capability {}
+unsafe impl Sync for Capability {}
 
 impl Capability {
     pub fn new(name: &str, function: *mut c_void) -> Self {

@@ -59,51 +59,42 @@ impl Config {
     }
 }
 
-#[get("/hello/{name}")]
-async fn greet(name: web::Path<String>) -> impl Responder {
-    let state = SERVER_STATE.lock().unwrap();
-    if let Some(server_state) = &*state {
-        let caps = &server_state.caps;
-        let cap = caps.get("blackboard_as_json_schema").unwrap();
-        unsafe {
-            let f: interfaces::capabilities::Function<unsafe extern "C" fn(*mut c_char) -> c_int> =
-                cap.get().unwrap();
-            let size = f(std::ptr::null_mut());
-            let mut buffer = vec![0u8; size as usize];
-            f(buffer.as_mut_ptr() as *mut c_char);
-            let result = std::ffi::CStr::from_ptr(buffer.as_ptr() as *const c_char)
-                .to_str()
-                .unwrap();
-            debug!("Blackboard schema: {}", result);
-            return format!("Message from blackboard: {}", result);
-        }
-    }
-    //let f: interfaces::Function<unsafe extern "C" fn() -> *const c_char> = cap.get().unwrap();
-
-    format!("Hello {}!", name)
-}
-
 #[get("/startproject")]
-async fn start_project() -> impl Responder {
-    
-    let state = SERVER_STATE.lock().unwrap();
-    if let Some(server_state) = &*state {
-        let caps = &server_state.caps;
-        let cap = caps.get("blackboard_set_string").unwrap();
-        unsafe {
-            let f: interfaces::capabilities::Function<unsafe extern "C" fn(*const c_char, *const c_char) -> c_int > = cap.get().unwrap();
-            let result = f("start_project\0".as_ptr() as *const c_char, "{\"value\": \"Hello World\"}\0".as_ptr() as *const c_char);
+async fn start_project(data: web::Data<AppData>) -> impl Responder {
+    data.caps
+        .get("blackboard_set_string")
+        .map(|cap| {
+            unsafe {
+                let f: interfaces::capabilities::Function<
+                    unsafe extern "C" fn(*const c_char, *const c_char) -> c_int,
+                > = cap.get().unwrap();
+                let result = f(
+                    "start_project\0".as_ptr() as *const c_char,
+                    "{\"value\": \"Hello World\"}\0".as_ptr() as *const c_char,
+                );
 
-            debug!("Start server project: {}", result);
-            return format!("Start project: {}", result);
-        }
-    }
+                debug!("Start server project: {}", result);
+                format!("Start project: {}", result)
+            }
+        })
+        .unwrap_or_else(|| "Capability not found".to_string());
+    // let state = SERVER_STATE.lock().unwrap();
+    // if let Some(server_state) = &*state {
+    //     let caps = &server_state.caps;
+    //     let cap = caps.get("blackboard_set_string").unwrap();
+    //     unsafe {
+    //         let f: interfaces::capabilities::Function<unsafe extern "C" fn(*const c_char, *const c_char) -> c_int > = cap.get().unwrap();
+    //         let result = f("start_project\0".as_ptr() as *const c_char, "{\"value\": \"Hello World\"}\0".as_ptr() as *const c_char);
+
+    //         debug!("Start server project: {}", result);
+    //         return format!("Start project: {}", result);
+    //     }
+    // }
 
     format!("Hello world!")
 }
 
 fn config_app(cfg: &mut web::ServiceConfig) {
-    cfg.service(greet);
     cfg.service(start_project);
 }
 
@@ -111,8 +102,11 @@ fn config_app(cfg: &mut web::ServiceConfig) {
 struct ServerState {
     server_task: tokio::task::JoinHandle<()>,
     server_handle: actix_web::dev::ServerHandle,
-    caps: interfaces::capabilities::Capabilities,
     rt: Runtime,
+}
+
+struct AppData {
+    caps: interfaces::capabilities::Capabilities,
 }
 
 lazy_static::lazy_static! {
@@ -158,8 +152,14 @@ fn start_server(
 
     info!("Starting server....");
 
+    let data = web::Data::new(AppData {
+        caps: interfaces::capabilities::Capabilities::from_raw(caps),
+    });
+
     let rt = Runtime::new().map_err(|e| format!("Error starting async runtime\n Reason: {}", e))?;
-    let bind_server = HttpServer::new(|| App::new().configure(config_app))
+    let bind_server = HttpServer::new( move || App::new().configure(config_app)
+        .app_data(data.clone())
+)
         .bind((config.hostname, config.port as u16))
         .map_err(|e| format!("Error binding server\n Reason: {}", e))?;
     let server = bind_server.run();
@@ -172,7 +172,6 @@ fn start_server(
     let server_state = ServerState {
         server_task: server_task,
         server_handle: server_handle,
-        caps: interfaces::capabilities::Capabilities::from_raw(caps),
         rt,
     };
 

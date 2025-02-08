@@ -179,7 +179,8 @@ async fn task_manager(compoents: Arc<Components>) -> Result<(), String> {
         let key = TASK_SENDER_RECV.receiver.try_recv();
         if key.is_ok() {
             let content = get_string_from_blackboard(&caps, "start_project\0").unwrap();
-            tokio::spawn(runner(content));
+            debug!("Received content: {}", content);
+            //tokio::spawn(runner(content));
         }
         interval.tick().await;
     }
