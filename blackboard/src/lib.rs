@@ -76,6 +76,10 @@ static SUMMARY_MESSAGE: &str = "{
         {
             \"capability\": \"blackboard_subscribe\",
             \"entry\": \"subscribe\"
+        },
+        { 
+            \"capability\": \"blackboard_unsubscribe\",
+            \"entry\": \"unsubscribe\"
         }
     ]
 }\0";
@@ -156,15 +160,10 @@ impl BlackBoardData {
         }
 
         if self.user_data.contains_key(&listener_key) {
-            if !self.user_data.get(&listener_key).unwrap().is_null() {
-                unsafe {
-                    drop(Box::from_raw(self.user_data.get(&listener_key).unwrap().clone()));
-                }
-            }
             self.user_data.remove(&listener_key);
         }
 
-        debug!("Unsubscribing from key: {}", key);
+        info!("Unsubscribing from key: {}", key);
     }
 
     fn notify(&self, key: &str) {
@@ -186,7 +185,8 @@ impl BlackBoardData {
                 > = cap.get().unwrap();
                 trace!("Calling listener: {}", listener);
                 if self.user_data.contains_key(listener) && !self.user_data.get(listener).unwrap().is_null() {
-                    f(key.as_ptr() as *const c_char, self.user_data.get(listener).unwrap().clone());
+                    let user_data = self.user_data.get(listener).unwrap().clone();
+                    f(key.as_ptr() as *const c_char, user_data);
                 } else {
                     f(key.as_ptr() as *const c_char, std::ptr::null_mut());
                 }
@@ -303,6 +303,7 @@ pub extern "C" fn stop() -> c_int {
     debug!("Stopping server");
     let mut blackboard_data = get_singleton().lock().unwrap();
     *blackboard_data = None;
+    info!("Blackboard is stopped");
     0
 }
 
@@ -1237,6 +1238,18 @@ mod tests {
         assert_eq!(result.is_ok(), true);
 
         let set_value = 42;
+        let result = set_int(key_c, set_value);
+        assert_eq!(result, 0);
+
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)).is_ok(), true);
+
+        let set_value = 43;
+        let result = set_int(key_c, set_value);
+        assert_eq!(result, 0);
+
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)).is_ok(), true);
+
+        let set_value = 60;
         let result = set_int(key_c, set_value);
         assert_eq!(result, 0);
 

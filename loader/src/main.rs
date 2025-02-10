@@ -14,7 +14,7 @@ use rtlibrary::RTLibrary;
 use std::{
     ffi::{c_char, c_int, c_void, CStr},
     path::PathBuf,
-    sync::Arc,
+    sync::{mpsc, Arc},
 };
 use tokio::signal;
 use tokio::time::{self, Duration as dur};
@@ -28,16 +28,6 @@ struct Args {
 struct SenderReceiver {
     sender: Sender<String>,
     receiver: Receiver<String>,
-}
-
-lazy_static! {
-    static ref TASK_SENDER_RECV: SenderReceiver = {
-        let (sender, receiver) = unbounded::<String>();
-        SenderReceiver {
-            sender: sender,
-            receiver: receiver,
-        }
-    };
 }
 
 fn load_libraries(config: &LibraryConfigs) -> Vec<RTLibrary> {
@@ -103,29 +93,71 @@ fn create_caps_blackboard(
     create_caps(&requires, library_list)
 }
 
-fn subscribe_to_blackboard(
-    caps: &interfaces::capabilities::Capabilities,
+fn unsubscribe_to_blackboard(caps: &interfaces::capabilities::Capabilities, key:&str) -> Result<(), String> {
+    let unsubscribe_cap = caps.get("blackboard_unsubscribe");
+
+    if unsubscribe_cap.is_none() {
+        return Err("Blackboard is not available".to_string());
+    }
+    let unsubscribe_fn: Function<
+        extern "C" fn(*const c_char, *const c_char) -> c_int> = unsafe { unsubscribe_cap.unwrap().get().unwrap() };
+
+    let key = key.as_ptr() as *const c_char;
+    let result = unsubscribe_fn(key, "loader\0".as_ptr() as *const c_char);
+
+    if result != 0 {
+        return Err("Failed to subscribe to blackboard".to_string());
+    }
+
+    return Ok(());
+}
+
+struct Unsubscriber<'a>{
+    caps: &'a interfaces::capabilities::Capabilities,
+    sender_ptr: *mut c_void,
+}
+
+impl Drop for Unsubscriber<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            drop (Arc::from_raw(self.sender_ptr as *mut mpsc::Sender<String>));
+        }
+        unsubscribe_to_blackboard(self.caps, "start_project\0").unwrap_or_else(
+            |e| error!("Failed to unsubscribe from blackboard: {}", e)
+        );
+        info!("Unsubscribing from blackboard");
+    }
+}
+
+
+fn subscribe_to_blackboard<'a>(
+    caps: &'a interfaces::capabilities::Capabilities,
     key: &str,
-    callback: extern "C" fn(*const c_char) -> c_int,
-) -> Result<(), String> {
+    callback: extern "C" fn(*const c_char, *mut c_void) -> c_int,
+) -> Result<(Unsubscriber<'a>, mpsc::Receiver<String>), String> {
     let subscribe_cap = caps.get("blackboard_subscribe");
 
     if subscribe_cap.is_none() {
         return Err("Blackboard is not available".to_string());
     }
     let subscribe_fn: Function<
-        extern "C" fn(*const c_char, *const c_char, callback: *mut c_void) -> c_int,
+        extern "C" fn(*const c_char, *const c_char, *mut c_void, *mut c_void) -> c_int,
     > = unsafe { subscribe_cap.unwrap().get().unwrap() };
 
     let key = key.as_ptr() as *const c_char;
     let callback = callback as *mut c_void;
 
-    let result = subscribe_fn(key, "loader\0".as_ptr() as *const c_char, callback);
+    let (async_sender, receiver): (mpsc::Sender<String>, mpsc::Receiver<String>) = mpsc::channel();
+    let sender = Arc::new(async_sender);
+    let sender_ptr    = Arc::into_raw(sender) as *mut c_void;
+
+    let result = subscribe_fn(key, "loader\0".as_ptr() as *const c_char, callback, sender_ptr);
     if result != 0 {
         return Err("Failed to subscribe to blackboard".to_string());
     }
-    return Ok(());
+    return Ok((Unsubscriber{caps, sender_ptr}, receiver));
 }
+
 
 fn get_string_from_blackboard(
     caps: &interfaces::capabilities::Capabilities,
@@ -158,32 +190,20 @@ fn get_string_from_blackboard(
     Ok(result.to_string())
 }
 
-async fn runner(content: String) {
-    
-    
-}
 
-async fn task_manager(compoents: Arc<Components>) -> Result<(), String> {
-    let mut interval = time::interval(dur::from_millis(100));
+extern "C" fn notify_callback(key: *const c_char, user_data: *mut c_void) -> c_int {
+    let key = unsafe { CStr::from_ptr(key).to_str().unwrap() };
+    debug!("Callback called for key: {}", key);
 
-    let caps = create_caps_blackboard(&compoents.inner);
-    let string_get_cap = caps.get("blackboard_get_string");
-
-    if string_get_cap.is_none() {
-        //panic!("Capability 'blackboard_set_string' not found");
-        error!("Blackboard is not available");
-        return Err("Blackboard is not available".to_string());
+    if user_data.is_null() {
+        return -1;
     }
+    let sender = unsafe { Arc::from_raw(user_data as *mut mpsc::Sender<String>) };
+    let sender_clone = Arc::clone(&sender);
+    std::mem::forget(sender);
+    sender_clone.send(key.to_string()).unwrap();
 
-    loop {
-        let key = TASK_SENDER_RECV.receiver.try_recv();
-        if key.is_ok() {
-            let content = get_string_from_blackboard(&caps, "start_project\0").unwrap();
-            debug!("Received content: {}", content);
-            //tokio::spawn(runner(content));
-        }
-        interval.tick().await;
-    }
+    0
 }
 
 
@@ -216,17 +236,30 @@ async fn main() -> Result<(), String> {
     components.start_services();
 
     let components = Arc::new(components);
-    let task_handle = tokio::spawn(task_manager(components.clone()));
-
-    extern "C" fn notify_callback(key: *const c_char) -> c_int {
-        let key = unsafe { CStr::from_ptr(key).to_str().unwrap() };
-        debug!("Callback called for key: {}", key);
-        TASK_SENDER_RECV.sender.send(key.to_string()).unwrap();
-        0
-    }
+    let thread_components = components.clone();
 
     let caps = create_caps_blackboard(&components.inner);
-    subscribe_to_blackboard(&caps, "start_project\0", notify_callback)?;
+    let (_unsubscriber, receiver) = subscribe_to_blackboard(&caps, "start_project\0", notify_callback )?;
+
+
+    let task_handle = tokio::spawn(async move {
+        let mut interval = time::interval(dur::from_millis(100));
+        let caps = create_caps_blackboard(&thread_components.inner);
+
+        loop {
+            let key = receiver.try_recv();
+            if key.is_ok() {
+                debug!("Received key: {}", key.unwrap());
+                let content = get_string_from_blackboard(&caps, "start_project\0").unwrap();
+                debug!("Received content: {}", content);
+                //tokio::spawn(runner(content));
+            }
+            interval.tick().await;
+        }
+    });
+        
+        
+        // task_manager(components.clone()));
 
     // Wait for Ctrl+C signal
     tokio::select! {
