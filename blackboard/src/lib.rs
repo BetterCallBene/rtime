@@ -84,19 +84,24 @@ static SUMMARY_MESSAGE: &str = "{
 struct BlackBoardData {
     data: HashMap<String, Box<dyn Any + Send>>,
     listener: interfaces::capabilities::Capabilities,
-    key_to_listener: HashMap<String, Vec<String>>,
+    user_data: HashMap<String, *mut c_void>,
+    key_to_listener: HashMap<String, Vec<String>>, // blackboard key
 }
+
+unsafe impl Send for BlackBoardData {}
+unsafe impl Sync for BlackBoardData {}
 
 impl BlackBoardData {
     fn new() -> Self {
         Self {
             data: HashMap::new(),
             listener: interfaces::capabilities::Capabilities::new(),
+            user_data: HashMap::new(),
             key_to_listener: HashMap::new(),
         }
     }
 
-    fn subscribe(&mut self, key: &str, component: &str, callback: *mut c_void) {
+    fn subscribe(&mut self, key: &str, component: &str, callback: *mut c_void, user_data: *mut c_void) {
         let listener_key = format!("{}_{}", key, component);
 
         if callback.is_null() {
@@ -126,6 +131,10 @@ impl BlackBoardData {
         let cap = interfaces::capabilities::Capability::new(&listener_key, callback);
         self.listener.add(cap);
 
+        if !user_data.is_null() {
+            self.user_data.insert(listener_key, user_data);
+        }
+
         debug!("Subscribing to key: {}", key);
     }
 
@@ -146,6 +155,15 @@ impl BlackBoardData {
             self.key_to_listener.remove(key);
         }
 
+        if self.user_data.contains_key(&listener_key) {
+            if !self.user_data.get(&listener_key).unwrap().is_null() {
+                unsafe {
+                    drop(Box::from_raw(self.user_data.get(&listener_key).unwrap().clone()));
+                }
+            }
+            self.user_data.remove(&listener_key);
+        }
+
         debug!("Unsubscribing from key: {}", key);
     }
 
@@ -161,12 +179,17 @@ impl BlackBoardData {
         for listener in listeners {
             trace!("Notifying listener: {}", listener);
             let cap = self.listener.get(listener).unwrap();
+            
             unsafe {
                 let f: interfaces::capabilities::Function<
-                    unsafe extern "C" fn(key: *const c_char) -> c_int,
+                    unsafe extern "C" fn(key: *const c_char, user_data: *mut c_void) -> c_int,
                 > = cap.get().unwrap();
                 trace!("Calling listener: {}", listener);
-                f(key.as_ptr() as *const c_char);
+                if self.user_data.contains_key(listener) && !self.user_data.get(listener).unwrap().is_null() {
+                    f(key.as_ptr() as *const c_char, self.user_data.get(listener).unwrap().clone());
+                } else {
+                    f(key.as_ptr() as *const c_char, std::ptr::null_mut());
+                }
                 trace!("Listener called: {}", listener);
             }
         }
@@ -781,6 +804,7 @@ fn subscribe_intern(
     key: *const c_char,
     component: *const c_char,
     callback: *mut c_void,
+    user_data: *mut c_void,
 ) -> Result<(), String> {
     let key = unsafe { CStr::from_ptr(key).to_str().unwrap() };
     let component = unsafe { CStr::from_ptr(component).to_str().unwrap() };
@@ -793,7 +817,7 @@ fn subscribe_intern(
     blackboard_data
         .as_mut()
         .unwrap()
-        .subscribe(key, component, callback);
+        .subscribe(key, component, callback, user_data);
     Ok(())
 }
 
@@ -802,8 +826,9 @@ pub extern "C" fn subscribe(
     key: *const c_char,
     component: *const c_char,
     callback: *mut c_void,
+    user_data: *mut c_void,
 ) -> c_int {
-    match subscribe_intern(key, component, callback) {
+    match subscribe_intern(key, component, callback, user_data) {
         Ok(_) => 0,
         Err(e) => {
             error!("Failed to subscribe: {}", e);
@@ -812,14 +837,40 @@ pub extern "C" fn subscribe(
     }
 }
 
+fn unsubscribe_intern(key: *const c_char, component: *const c_char) -> Result<(), String> {
+    let key = unsafe { CStr::from_ptr(key).to_str().unwrap() };
+    let component = unsafe { CStr::from_ptr(component).to_str().unwrap() };
+
+    let mut blackboard_data = get_singleton().lock().unwrap();
+    if blackboard_data.is_none() {
+        return Err("Server is not running".to_string());
+    }
+
+    blackboard_data.as_mut().unwrap().unsubscribe(key, component);
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "C" fn unsubscribe(key: *const c_char, component: *const c_char) -> c_int {
+    match unsubscribe_intern(key, component) {
+        Ok(_) => 0,
+        Err(e) => {
+            error!("Failed to unsubscribe: {}", e);
+            -1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_void;
+    use std::time::Duration;
     use super::*;
     use assert_float_eq::assert_f32_near;
-    use interfaces::capabilities::Function;
     use rstest::fixture;
     use rstest::rstest;
     use serial_test::serial;
+    use std::sync::mpsc;
 
     #[rstest]
     #[serial]
@@ -1120,7 +1171,7 @@ mod tests {
 
         static mut CALLBACK_CALLED: bool = false;
 
-        extern "C" fn callback(key: *const c_char) -> c_int {
+        extern "C" fn callback(key: *const c_char, user_data: *mut c_void) -> c_int {
             let key = unsafe { CStr::from_ptr(key).to_str().unwrap() };
             debug!("Callback called for key: {}", key);
             unsafe {
@@ -1134,7 +1185,7 @@ mod tests {
         let component = "component\0";
         let component_c = component.as_ptr() as *const c_char;
 
-        let result = subscribe_intern(key_c, component_c, callback as *mut c_void);
+        let result = subscribe_intern(key_c, component_c, callback as *mut c_void, std::ptr::null_mut());
         assert_eq!(result.is_ok(), true);
         let callback_called = unsafe { CALLBACK_CALLED };
         assert_eq!(callback_called, false);
@@ -1144,6 +1195,55 @@ mod tests {
         let callback_called = unsafe { CALLBACK_CALLED };
         assert_eq!(callback_called, true);
 
+        let result = unsubscribe_intern(key_c, component_c);
+        assert_eq!(result.is_ok(), true);
+
+    }
+
+    #[rstest]
+    #[serial]
+    #[test_log::test]
+    fn test_subscribe_with_user_data(startup: c_int) {
+        assert_eq!(startup, 0);
+
+        
+        let (sender, receiver): (mpsc::Sender<String>, mpsc::Receiver<String>) = mpsc::channel();
+        let sender_ptr = Box::into_raw(Box::new(sender));
+
+        extern "C" fn callback(key: *const c_char, user_data: *mut c_void) -> c_int {
+            let key = unsafe { CStr::from_ptr(key).to_str().unwrap() };
+            debug!("Callback called for key: {}", key);
+
+            if user_data.is_null() {
+                error!("User data is null");
+                return -1;
+            }
+
+            let sender = unsafe { &*(user_data as *mut mpsc::Sender<String>) };
+
+            sender.send(key.to_string()).unwrap_or_else(|e| {
+                error!("Failed to send key: {}", key);
+            }
+            );
+            0
+        }
+        
+        let key = "int_key\0";
+        let key_c = key.as_ptr() as *const c_char;
+        let component = "component\0";
+        let component_c = component.as_ptr() as *const c_char;
+
+        let result = subscribe_intern(key_c, component_c, callback as *mut c_void, sender_ptr as *mut c_void);
+        assert_eq!(result.is_ok(), true);
+
+        let set_value = 42;
+        let result = set_int(key_c, set_value);
+        assert_eq!(result, 0);
+
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)).is_ok(), true);
+        
+        let result = unsubscribe_intern(key_c, component_c);
+        assert_eq!(result.is_ok(), true);
     }
 
     #[rstest]
