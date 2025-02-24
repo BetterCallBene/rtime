@@ -61,37 +61,30 @@ impl Config {
 
 #[get("/startproject")]
 async fn start_project(data: web::Data<AppData>) -> impl Responder {
-    data.caps
-        .get("blackboard_set_string")
-        .map(|cap| {
-            unsafe {
-                let f: interfaces::capabilities::Function<
-                    unsafe extern "C" fn(*const c_char, *const c_char) -> c_int,
-                > = cap.get().unwrap();
-                let result = f(
-                    "start_project\0".as_ptr() as *const c_char,
-                    "{\"value\": \"Hello World\"}\0".as_ptr() as *const c_char,
-                );
 
-                debug!("Start server project: {}", result);
-                format!("Start project: {}", result)
-            }
-        })
-        .unwrap_or_else(|| "Capability not found".to_string());
-    // let state = SERVER_STATE.lock().unwrap();
-    // if let Some(server_state) = &*state {
-    //     let caps = &server_state.caps;
-    //     let cap = caps.get("blackboard_set_string").unwrap();
-    //     unsafe {
-    //         let f: interfaces::capabilities::Function<unsafe extern "C" fn(*const c_char, *const c_char) -> c_int > = cap.get().unwrap();
-    //         let result = f("start_project\0".as_ptr() as *const c_char, "{\"value\": \"Hello World\"}\0".as_ptr() as *const c_char);
+    web::block(
+        move || {
+            data.caps
+                .get("blackboard_set_string")
+                .map(|cap| {
+                    unsafe {
+                        let f: interfaces::capabilities::Function<
+                            unsafe extern "C" fn(*const c_char, *const c_char) -> c_int,
+                        > = cap.get().unwrap();
+                        let result = f(
+                            "start_project\0".as_ptr() as *const c_char,
+                            "{\"value\": \"Hello World\"}\0".as_ptr() as *const c_char,
+                        );
 
-    //         debug!("Start server project: {}", result);
-    //         return format!("Start project: {}", result);
-    //     }
-    // }
+                        debug!("Start server project: {}", result);
+                        format!("Start project: {}", result)
+                    }
+                })
+                .unwrap_or_else(|| "Capability not found".to_string())
+        }
+    ).await.unwrap_or_else(|e| format!("Error: {:?}", e))
+    
 
-    format!("Hello world!")
 }
 
 fn config_app(cfg: &mut web::ServiceConfig) {
